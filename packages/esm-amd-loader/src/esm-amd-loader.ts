@@ -21,7 +21,8 @@ interface Window {
 }
 
 type OnExecutedCallback = (...args: Array<{}>) => void;
-type onFailedCallback = (error: Error) => void;
+type OnFailedCallback = (error: Error) => void;
+type OnLoadedCallback = (error: Error | undefined) => void;
 type NormalizedUrl = string&{_normalized: never};
 
 (function() {
@@ -139,6 +140,12 @@ interface ModuleG<State extends keyof StateDataMap> {
    * module.
    */
   readonly crossorigin: string;
+
+  /**
+   * True if this is loaded using window.fetch, false if otherwise.
+   */
+  readonly useFetch: boolean;
+
   /**
    * Callbacks that are called exactly once, for the next time the module
    * progresses to a new state.
@@ -187,11 +194,22 @@ let topLevelScriptIdx = 0;
 let previousTopLevelUrl: NormalizedUrl|undefined = undefined;
 let baseUrl = getBaseUrl();
 
-/** Begin loading a module from the network. */
-function load(module: ModuleG<StateEnum.Initialized>):
-    ModuleG<StateEnum.Loading> {
-  const mutatedModule = stateTransition(module, StateEnum.Loading, undefined);
+function loadFetch(module: ModuleG<StateEnum.Initialized>, cb: OnLoadedCallback) {
+  fetch(module.url).then((response) => {
+    if (response.ok) {
+        return response.text();
+    }
 
+    throw new TypeError('Failed to fetch ' + module.url);
+  }).then((code) => {
+      const script = document.createElement('script');
+      script.text = code;
+      document.head.appendChild(script);
+      return undefined;
+  }).then(cb, cb);
+}
+
+function loadScript(module: ModuleG<StateEnum.Initialized>, cb: OnLoadedCallback) {
   const script = document.createElement('script');
   script.src = module.url;
 
@@ -215,6 +233,22 @@ function load(module: ModuleG<StateEnum.Initialized>):
   }
 
   script.onload = () => {
+    cb(undefined);
+    removeScript();
+  };
+  script.onerror = () => {
+    cb(new TypeError('Failed to fetch ' + module.url));
+    removeScript();
+  };
+  document.head!.appendChild(script);
+}
+
+/** Begin loading a module from the network. */
+function load(module: ModuleG<StateEnum.Initialized>):
+    ModuleG<StateEnum.Loading> {
+  const mutatedModule = stateTransition(module, StateEnum.Loading, undefined);
+
+  function onLoaded() {
     let deps: string[], moduleBody;
     if (pendingDefine !== undefined) {
       [deps, moduleBody] = pendingDefine();
@@ -226,15 +260,13 @@ function load(module: ModuleG<StateEnum.Initialized>):
       moduleBody = undefined;
     }
     beginWaitingForTurn(mutatedModule, deps, moduleBody);
-    removeScript();
-  };
+  }
 
-  script.onerror = () => {
-    fail(module, new TypeError('Failed to fetch ' + module.url));
-    removeScript();
-  };
-
-  document.head!.appendChild(script);
+  if (module.useFetch) {
+    loadFetch(module, onLoaded);
+  } else {
+    loadScript(module, onLoaded);
+  }
 
   return mutatedModule;
 }
@@ -266,7 +298,7 @@ function loadDeps(
       args.push(function(
           deps: string[],
           onExecuted?: OnExecutedCallback,
-          onError?: onFailedCallback) {
+          onError?: OnFailedCallback) {
         const [args, depModules] = loadDeps(module, deps);
 
         executeDependenciesInOrder(depModules, () => {
@@ -290,7 +322,7 @@ function loadDeps(
 
     // We have a dependency on a real module.
     const dependency =
-      getModule(resolveUrl(module.urlBase, depSpec), module.crossorigin);
+      getModule(resolveUrl(module.urlBase, depSpec), module.crossorigin, module.useFetch);
     args.push(dependency.exports);
     depModules.push(dependency);
 
@@ -352,7 +384,7 @@ function fail(mod: Module, error: Error) {
 function executeDependenciesInOrder(
     deps: Module[],
     onAllExecuted: OnExecutedCallback|undefined,
-    onFailed: onFailedCallback|undefined): void {
+    onFailed: OnFailedCallback|undefined): void {
   const nextDep = deps.shift();
   if (nextDep === undefined) {
     if (onAllExecuted) {
@@ -456,13 +488,20 @@ window.define = function(deps: string[], moduleBody?: OnExecutedCallback) {
   const crossorigin = document.currentScript &&
       document.currentScript.getAttribute('crossorigin') || 'anonymous';
 
+  // Read the custom `use-fetch` attribute. If this is set to any value we
+  // will use window.fetch for getting the source of the script to avoid
+  // CORS problems when executing inside a WKWebView. The environment is
+  // responsible for providing a suitable fetch implementation for this case.
+  const useFetch = document.currentScript &&
+      Boolean(document.currentScript.getAttribute('use-fetch')) || false;
+
   setTimeout(() => {
     if (defined === false) {
       pendingDefine = undefined;
       const url = documentUrl + '#' + topLevelScriptIdx++ as NormalizedUrl;
       // It's actually Initialized, but we're skipping over the Loading
       // state, because this is a top level document and it's already loaded.
-      const mod = getModule(url, crossorigin) as ModuleG<StateEnum.Loading>;
+      const mod = getModule(url, crossorigin, useFetch) as ModuleG<StateEnum.Loading>;
       mod.isTopLevel = true;
       const waitingModule = beginWaitingForTurn(mod, deps, moduleBody);
       if (previousTopLevelUrl !== undefined) {
@@ -511,7 +550,7 @@ window.define._reset = () => {
  * Return a module object from the registry for the given URL, creating one if
  * it doesn't exist yet.
  */
-function getModule(url: NormalizedUrl, crossorigin: string = 'anonymous') {
+function getModule(url: NormalizedUrl, crossorigin: string = 'anonymous', useFetch: boolean = false) {
   let mod = registry[url];
   if (mod === undefined) {
     mod = registry[url] = {
@@ -522,7 +561,8 @@ function getModule(url: NormalizedUrl, crossorigin: string = 'anonymous') {
       stateData: undefined,
       isTopLevel: false,
       crossorigin,
-      onNextStateChange: []
+      onNextStateChange: [],
+      useFetch: useFetch,
     };
   }
   return mod;
